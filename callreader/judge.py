@@ -1,6 +1,8 @@
 """Read a call with Muse Spark, then let code decide which verdicts survive."""
 from __future__ import annotations
 
+import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 
 from . import meta
@@ -24,8 +26,9 @@ Rules — they are strict:
    if it is not found verbatim, your verdict is discarded.
 3. If the sources do not state the rule, answer UNREAD with quote "". Silence is not permission:
    "no mention of AI" is UNREAD unless you have read every source end to end.
-4. If the rule has a condition ("unless", "only if", "except", "단,", "ただし"), put that clause in "condition".
-   A verdict without its governing condition is wrong.
+4. If the rule has a condition ("unless", "only if", "except", "단,", "ただし"), put that clause in "condition"
+   and copy the source text that states it, verbatim, into "condition_quote". A verdict without its governing
+   condition is wrong; a condition you cannot quote will be shown to the entrant as unverified.
 5. "answer" is a one-line plain-English summary for the entrant.
 
 Axes:
@@ -35,25 +38,74 @@ Axes:
    (e.g. "2026-11-30T23:59:00-05:00"); if no time zone is stated write the date only. Do not judge whether it
    has passed — code compares it with the current time ({now}).
 
-Return ONLY a JSON array: [{{"axis": key, "verdict": ..., "answer": ..., "quote": ..., "source": id, "page": n, "condition": ..., "deadline_iso": ...}}]
+Return JSON: {{"items": [{{"axis": key, "verdict": ..., "answer": ..., "quote": ..., "source": id, "page": n, "condition": ..., "condition_quote": ..., "deadline_iso": ...}}]}}
+Use "" for empty strings and 0 for an unknown page.
 
 SOURCES:
 {sources}
 """
 
+SUPPORT_PROMPT = """You are auditing verdicts about an open call. For each item, decide ONLY from the quoted text
+(and its condition quote) whether the quote by itself establishes the verdict for this entrant:
+{profile}
+
+A quote that names a topic does not establish a rule about it. "The theme is generative AI" says nothing
+about whether AI tools may be used to make the entry. A quote about one thing does not settle another.
+Judge the verdict on the axis question only; extra detail in the summary that the quote does not cover is
+not by itself a reason for false. When unsure, answer false.
+
+Items:
+{items}
+
+Return JSON: {{"items": [{{"axis": key, "supported": true|false, "why": "one short sentence"}}]}}"""
+
+_S = {"type": "string"}
+VERDICTS_SCHEMA = meta.obj({"items": {"type": "array", "items": meta.obj({
+    "axis": {"type": "string", "enum": [a.key for a in AXES]},
+    "verdict": {"type": "string", "enum": ["PASS", "FAIL", "UNREAD"]},
+    "answer": _S, "quote": _S, "source": _S, "page": {"type": "integer"},
+    "condition": _S, "condition_quote": _S, "deadline_iso": _S})}})
+SUPPORT_SCHEMA = meta.obj({"items": {"type": "array", "items": meta.obj({
+    "axis": _S, "supported": {"type": "boolean"}, "why": _S})}})
+
 DEFAULT_PROFILE = "An individual (solo, not a student) living in South Korea, entering online, who uses generative AI tools."
 
 
+VISION_MAX_PDF_PAGES = 20
+
+
+def _transcribe(png: bytes, mime: str) -> str:
+    text = meta.chat([{"role": "user", "content": [
+        {"type": "text", "text": TRANSCRIBE_PROMPT}, meta.image_part(png, mime)]}])
+    return "" if text.strip() == "EMPTY" else text
+
+
+def _render_pdf(data: bytes, limit: int) -> list[bytes]:
+    import pymupdf
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    return [doc[i].get_pixmap(dpi=150).tobytes("png") for i in range(min(limit, doc.page_count))]
+
+
 def ocr_images(card_sources: list[dict]) -> None:
-    """Image sources (posters) and scanned PDFs have no text layer: transcribe them with vision."""
+    """Posters have no text layer, and a PDF's text layer can be out of reading order or missing.
+    Muse Spark vision reads both; a PDF keeps its text layer AND gains a vision transcription as a sibling
+    source, so a quote is verified against whichever reading preserved it."""
+    jobs = []  # (target source, page index, image bytes, mime)
+    extra = []
     for src in card_sources:
-        if src["kind"] in ("image",) and src.get("bytes"):
-            text = meta.chat([{"role": "user", "content": [
-                {"type": "text", "text": TRANSCRIBE_PROMPT},
-                meta.image_part(src["bytes"], src.get("mime", "image/png")),
-            ]}])
-            src["pages"] = ["" if text.strip() == "EMPTY" else text]
+        if src["kind"] == "image" and src.get("bytes"):
+            jobs.append((src, 0, src["bytes"], src.get("mime", "image/png")))
             src["kind"] = "image-ocr"
+        elif src["kind"] in ("pdf", "pdf-scan") and src.get("bytes"):
+            pngs = _render_pdf(src["bytes"], VISION_MAX_PDF_PAGES)
+            sib = {"id": f"{src['id']}.vision", "kind": "pdf-vision", "url": src["url"], "pages": [""] * len(pngs)}
+            extra.append(sib)
+            jobs += [(sib, i, png, "image/png") for i, png in enumerate(pngs)]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        texts = list(pool.map(lambda j: _transcribe(j[2], j[3]), jobs))
+    for (src, i, _, _), text in zip(jobs, texts):
+        src["pages"][i] = text
+    card_sources.extend(extra)
 
 
 def _render_sources(sources: list[dict], budget_chars: int = 180_000) -> str:
@@ -101,9 +153,9 @@ def judge(card: Card, profile: str = DEFAULT_PROFILE) -> Card:
     items = None
     for attempt in range(2):
         # Reasoning tokens count against max_tokens; a long call can exhaust the budget before any JSON is written.
-        raw = meta.chat([{"role": "user", "content": prompt}], max_tokens=32000)
+        raw = meta.chat([{"role": "user", "content": prompt}], max_tokens=32000, schema=VERDICTS_SCHEMA)
         try:
-            items = meta.parse_json(raw)
+            items = meta.parse_json(raw)["items"]
             break
         except ValueError:
             continue
@@ -119,7 +171,10 @@ def judge(card: Card, profile: str = DEFAULT_PROFILE) -> Card:
             continue
         claimed = str(it.get("verdict", "UNREAD")).upper()
         f = Finding(axis=a.key, state=State.UNREAD, answer=it.get("answer", ""), quote=it.get("quote", "") or "",
-                    condition=it.get("condition", "") or "", model_state=claimed)
+                    condition=it.get("condition", "") or "", condition_quote=it.get("condition_quote", "") or "",
+                    model_state=claimed)
+        if f.condition:
+            f.condition_verified = bool(f.condition_quote) and check_quote(f.condition_quote, card.sources).found
         if claimed in ("PASS", "FAIL"):
             chk = check_quote(f.quote, card.sources)
             if chk.found:
@@ -139,4 +194,27 @@ def judge(card: Card, profile: str = DEFAULT_PROFILE) -> Card:
                 f.state = State.UNREAD
                 f.note = (f.note + "; " if f.note else "") + f"{len(card.unread_sources)} attachment(s) unread"
         card.findings.append(f)
+    audit_support(card, profile)
     return card
+
+
+def audit_support(card: Card, profile: str) -> None:
+    """Second reading: the quote exists, but does it say what the verdict claims? Only ever demotes."""
+    claimed = [f for f in card.findings if f.state in (State.PASS, State.FAIL) and f.axis != "deadline"]
+    if not claimed:
+        return
+    question = {a.key: f"{a.question} (FAIL means: {a.fail_means})" for a in AXES}
+    items = "\n".join(json.dumps({"axis": f.axis, "question": question[f.axis], "verdict": f.state.value,
+                                  "summary": f.answer, "quote": f.quote,
+                                  "condition_quote": f.condition_quote}, ensure_ascii=False) for f in claimed)
+    try:
+        raw = meta.chat([{"role": "user", "content": SUPPORT_PROMPT.format(profile=profile, items=items)}],
+                        max_tokens=16000, schema=SUPPORT_SCHEMA)
+        rows = {r.get("axis"): r for r in meta.parse_json(raw)["items"] if isinstance(r, dict)}
+    except (ValueError, KeyError):
+        return  # audit unavailable: keep code-verified verdicts, but say so
+    for f in claimed:
+        r = rows.get(f.axis)
+        if r and r.get("supported") is False:
+            f.note = (f.note + "; " if f.note else "") + f"demoted from {f.state.value}: quote does not establish it — {r.get('why', '')}"
+            f.state = State.UNREAD

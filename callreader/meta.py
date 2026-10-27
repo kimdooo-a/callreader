@@ -13,27 +13,48 @@ MODEL = os.environ.get("CALLREADER_MODEL", "muse-spark-1.3")
 
 _client: OpenAI | None = None
 usage_log: list[dict] = []
+sam_images = 0  # SAM 3.1 is billed per image, not per token
+
+
+def api_key() -> str:
+    key = os.environ.get("MODEL_API_KEY")
+    if not key:
+        raise RuntimeError("MODEL_API_KEY is not set")
+    return key
 
 
 def client() -> OpenAI:
     global _client
     if _client is None:
-        key = os.environ.get("MODEL_API_KEY")
-        if not key:
-            raise RuntimeError("MODEL_API_KEY is not set")
-        _client = OpenAI(base_url="https://api.meta.ai/v1", api_key=key)
+        _client = OpenAI(base_url="https://api.meta.ai/v1", api_key=api_key())
     return _client
 
 
-def chat(messages: list[dict], max_tokens: int = 8000, retries: int = 4) -> str:
-    """One chat call with backoff. Records token usage for cost accounting."""
+def obj(props: dict, required: list[str] | None = None) -> dict:
+    """Strict JSON-schema object: every property required unless listed otherwise."""
+    return {"type": "object", "properties": props, "required": required if required is not None else list(props),
+            "additionalProperties": False}
+
+
+def chat(messages: list[dict], max_tokens: int = 8000, retries: int = 4, schema: dict | None = None) -> str:
+    """One chat call with backoff. Records token usage for cost accounting.
+    With `schema`, structured output guarantees the reply parses as that JSON shape."""
+    extra = {}
+    if schema is not None:
+        extra["response_format"] = {"type": "json_schema", "json_schema": {"name": "reply", "strict": True, "schema": schema}}
     delay = 1.0
     for attempt in range(retries):
         try:
-            r = client().chat.completions.create(model=MODEL, messages=messages, max_tokens=max_tokens)
+            r = client().chat.completions.create(model=MODEL, messages=messages, max_tokens=max_tokens, **extra)
             u = r.usage
-            usage_log.append({"in": getattr(u, "prompt_tokens", 0), "out": getattr(u, "completion_tokens", 0)})
-            return r.choices[0].message.content or ""
+            usage_log.append({"in": getattr(u, "prompt_tokens", 0), "out": getattr(u, "completion_tokens", 0),
+                              "finish": r.choices[0].finish_reason})
+            content = r.choices[0].message.content or ""
+            if os.environ.get("CALLREADER_DEBUG"):
+                with open(os.environ["CALLREADER_DEBUG"], "a", encoding="utf-8") as fh:
+                    fh.write(f"\n===== finish={r.choices[0].finish_reason} in={u.prompt_tokens} "
+                             f"out={u.completion_tokens}\n{content}\n")
+            return content
         except Exception:  # rate limits and transient 5xx
             if attempt == retries - 1:
                 raise
@@ -61,4 +82,4 @@ def parse_json(text: str):
 def cost_usd() -> float:
     tin = sum(u["in"] for u in usage_log)
     tout = sum(u["out"] for u in usage_log)
-    return tin / 1e6 * 1.25 + tout / 1e6 * 4.25
+    return tin / 1e6 * 1.25 + tout / 1e6 * 4.25 + sam_images * 0.0025

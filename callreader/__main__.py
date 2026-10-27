@@ -40,7 +40,10 @@ def main() -> int:
         if f.quote and f.state != State.UNREAD:
             print(f"           “{f.quote}”  — {f.source_id} p.{f.page}")
         if f.condition:
-            print(f"           condition: {f.condition}")
+            tag = "condition" if f.condition_verified else "condition (UNVERIFIED — no quote found)"
+            print(f"           {tag}: {f.condition}")
+            if f.condition_verified:
+                print(f"             “{f.condition_quote}”")
         if f.note:
             print(f"           note: {f.note}")
     for u in card.unread_sources:

@@ -13,7 +13,8 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from pypdf import PdfReader
+
+from .docs import extract
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
 ATTACH_EXT = re.compile(r"\.(pdf|png|jpe?g|webp)(\?|$)", re.IGNORECASE)
@@ -47,24 +48,49 @@ def _text_from_html(html: str) -> tuple[str, str]:
     return title, text + ("\n" + "\n".join(extras) if extras else "")
 
 
-def sniff(data: bytes) -> str:
-    head = data[:16]
-    if head.startswith(b"%PDF"):
-        return "pdf"
-    if head.startswith(b"\x89PNG"):
-        return "png"
-    if head[:3] == b"\xff\xd8\xff":
-        return "jpeg"
-    if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "webp"
-    if b"<html" in data[:512].lower() or b"<!doctype" in data[:512].lower():
-        return "html"
-    return "unknown"
+MIN_POSTER_SIDE = 300  # logos and icons are not posters
 
 
-def pdf_pages(data: bytes) -> list[str]:
-    reader = PdfReader(io.BytesIO(data))
-    return [(p.extract_text() or "") for p in reader.pages]
+def _image_size(data: bytes) -> tuple[int, int]:
+    from PIL import Image
+    try:
+        return Image.open(io.BytesIO(data)).size
+    except Exception:
+        return (0, 0)
+
+
+def image_key(data: bytes) -> int:
+    """64-bit average hash: a poster and its thumbnail get the same key."""
+    from PIL import Image
+    g = Image.open(io.BytesIO(data)).convert("L").resize((8, 8))
+    px = list(g.tobytes())
+    avg = sum(px) / 64
+    return sum(1 << i for i, v in enumerate(px) if v > avg)
+
+
+def _same_image(a: int, b: int) -> bool:
+    return bin(a ^ b).count("1") <= 4
+
+
+def source_from_bytes(data: bytes, url: str, sid: str) -> dict:
+    """{"source": …} | {"unread": …} | {"skip": reason} | {"html": …} for one downloaded file."""
+    kind, pages, why = extract(data)
+    if kind in ("pdf", "pdf-scan", "hwpx", "hwp"):
+        if pages is None:
+            return {"unread": {"url": url, "reason": why}}
+        src = {"id": sid, "kind": kind, "url": url, "pages": pages}
+        if kind in ("pdf", "pdf-scan"):
+            src["bytes"] = data  # read twice: text layer here, rendered pages by vision later
+        return {"source": src}
+    if kind in ("png", "jpeg", "webp"):
+        w, h = _image_size(data)
+        if min(w, h) < MIN_POSTER_SIDE:
+            return {"skip": f"small image {w}x{h}"}
+        return {"source": {"id": sid, "kind": "image", "url": url, "pages": [""], "bytes": data,
+                           "mime": f"image/{kind}", "size": [w, h]}}
+    if kind == "html":
+        return {"html": data}
+    return {"unread": {"url": url, "reason": f"unsupported file type ({kind})"}}
 
 
 def find_attachments(html: str, base: str) -> list[str]:
@@ -86,37 +112,53 @@ def find_attachments(html: str, base: str) -> list[str]:
     return urls[:MAX_ATTACH]
 
 
-def fetch_call(url: str, timeout: int = 30) -> dict:
+def _viewer_image(html: bytes, base: str) -> str | None:
+    """Some boards link posters through an HTML viewer (view_image.php); take the one big <img> inside."""
+    soup = BeautifulSoup(html, "html.parser")
+    imgs = [urljoin(base, i["src"]) for i in soup.find_all("img", src=True)]
+    imgs = [u for u in imgs if ATTACH_EXT.search(u)]
+    return imgs[0] if len(imgs) == 1 else None
+
+
+def fetch_call(url: str, timeout: int = 30, session: requests.Session | None = None, prefix: str = "") -> dict:
     """Return {title, sources: [{id, kind, url, pages|image}], unread: [{url, reason}]}."""
-    s = requests.Session()
+    s = session or requests.Session()
     s.headers.update({"User-Agent": UA})
     r = s.get(url, timeout=timeout)
     r.raise_for_status()
     html = decode(r)
     title, text = _text_from_html(html)
-    sources = [{"id": "page", "kind": "html", "url": url, "pages": [text]}]
+    sources = [{"id": f"{prefix}page", "kind": "html", "url": url, "pages": [text]}]
     unread: list[dict] = []
+    images: list[dict] = []
     for i, au in enumerate(find_attachments(html, url), 1):
+        sid = f"{prefix}att{i}"
         try:
             ar = s.get(au, timeout=timeout, headers={"Referer": url})
             ar.raise_for_status()
-            kind = sniff(ar.content)
-            sid = f"att{i}"
-            if kind == "pdf":
-                pages = pdf_pages(ar.content)
-                if not any(p.strip() for p in pages):
-                    # Scanned PDF: no text layer. Needs vision OCR, not silence.
-                    sources.append({"id": sid, "kind": "pdf-scan", "url": au, "pages": pages, "bytes": ar.content})
-                else:
-                    sources.append({"id": sid, "kind": "pdf", "url": au, "pages": pages})
-            elif kind in ("png", "jpeg", "webp"):
-                sources.append({"id": sid, "kind": "image", "url": au, "pages": [""], "bytes": ar.content, "mime": f"image/{kind}"})
-            elif kind == "html" and ATTACH_EXT.search(au):
-                unread.append({"url": au, "reason": f"server returned an HTML page ({len(ar.content)} bytes) instead of the file — likely needs a session or referer"})
-            elif kind == "html":
-                continue  # an ordinary linked page, not an attachment
-            else:
-                unread.append({"url": au, "reason": f"unsupported file type ({kind})"})
+            got = source_from_bytes(ar.content, au, sid)
+            if "html" in got and ATTACH_EXT.search(au):
+                inner = _viewer_image(got["html"], au)
+                if inner:
+                    ar = s.get(inner, timeout=timeout, headers={"Referer": au})
+                    got = source_from_bytes(ar.content, inner, sid)
+                if "html" in got:
+                    got = {"unread": {"url": au, "reason": f"server returned an HTML page ({len(ar.content)} bytes) "
+                                                          "instead of the file — likely needs a session or referer"}}
+            if "source" in got:
+                src = got["source"]
+                if src["kind"] == "image":
+                    # The same poster is often linked twice (viewer + thumbnail); keep the largest copy only.
+                    src["key"] = image_key(src["bytes"])
+                    twin = next((o for o in images if _same_image(o["key"], src["key"])), None)
+                    if twin:
+                        if src["size"][0] > twin["size"][0]:
+                            twin.update({k: src[k] for k in ("url", "bytes", "mime", "size")})
+                        continue
+                    images.append(src)
+                sources.append(src)
+            elif "unread" in got:
+                unread.append(got["unread"])
         except requests.RequestException as e:
             unread.append({"url": au, "reason": f"download failed: {e.__class__.__name__}"})
     return {"title": title, "sources": sources, "unread": unread, "html": html, "session": s}
@@ -145,14 +187,14 @@ def fetch_linked_page(session: requests.Session, url: str, referer: str, sid: st
         r.raise_for_status()
     except requests.RequestException as e:
         return {"unread": {"url": url, "reason": f"download failed: {e.__class__.__name__}"}}
-    kind = sniff(r.content)
-    if kind == "pdf":
-        return {"source": {"id": sid, "kind": "pdf", "url": url, "pages": pdf_pages(r.content)}}
-    if kind == "html":
-        html = decode(r)
-        title, text = _text_from_html(html)
-        if len(text.strip()) < 200:
-            # Script-rendered pages arrive empty; that is "unread", not "no rules".
-            return {"unread": {"url": url, "reason": "page body is empty without JavaScript (client-rendered)"}}
-        return {"source": {"id": sid, "kind": "html", "url": url, "pages": [text], "title": title}, "html": html}
-    return {"unread": {"url": url, "reason": f"unsupported file type ({kind})"}}
+    got = source_from_bytes(r.content, url, sid)
+    if "source" in got or "unread" in got:
+        return got
+    if "skip" in got:
+        return {"unread": {"url": url, "reason": got["skip"]}}
+    html = decode(r)
+    title, text = _text_from_html(html)
+    if len(text.strip()) < 200:
+        # Script-rendered pages arrive empty; that is "unread", not "no rules".
+        return {"unread": {"url": url, "reason": "page body is empty without JavaScript (client-rendered)"}}
+    return {"source": {"id": sid, "kind": "html", "url": url, "pages": [text], "title": title}, "html": html}

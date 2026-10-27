@@ -44,6 +44,8 @@ class Finding:
     answer: str = ""
     quote: str = ""
     condition: str = ""          # the "unless / only if" clause that governs the verdict
+    condition_quote: str = ""    # verbatim source text for the condition
+    condition_verified: bool | None = None  # None = no condition; False = the model asserted it without a quote we found
     source_id: str | None = None
     page: int | None = None
     note: str = ""               # why it was demoted, if it was
