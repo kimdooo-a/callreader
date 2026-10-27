@@ -7,8 +7,8 @@ import sys
 from dataclasses import asdict
 
 from . import meta
+from .agent import explore
 from .axes import Card, State
-from .fetch import fetch_call
 from .judge import judge
 
 ICON = {State.PASS: "PASS  ", State.FAIL: "FAIL  ", State.UNREAD: "UNREAD"}
@@ -18,9 +18,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="callreader")
     ap.add_argument("url")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--hops", type=int, default=2, help="how many link hops the agent may follow (0 = page + attachments only)")
     args = ap.parse_args()
 
-    got = fetch_call(args.url)
+    got = explore(args.url, hops=args.hops, log=lambda m: print(m, file=sys.stderr))
     card = Card(url=args.url, title=got["title"], sources=got["sources"], unread_sources=got["unread"])
     judge(card)
 

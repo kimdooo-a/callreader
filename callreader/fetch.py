@@ -104,4 +104,39 @@ def fetch_call(url: str, timeout: int = 30) -> dict:
                 unread.append({"url": au, "reason": f"unsupported file type ({kind})"})
         except requests.RequestException as e:
             unread.append({"url": au, "reason": f"download failed: {e.__class__.__name__}"})
-    return {"title": title, "sources": sources, "unread": unread}
+    return {"title": title, "sources": sources, "unread": unread, "html": r.text, "session": s}
+
+
+def all_links(html: str, base: str, limit: int = 150) -> list[dict]:
+    """Every outgoing link with its visible label — the menu the agent chooses from."""
+    soup = BeautifulSoup(html, "html.parser")
+    seen, out = set(), []
+    for a in soup.find_all("a", href=True):
+        href = urljoin(base, a["href"]).split("#")[0]
+        if urlparse(href).scheme not in ("http", "https") or href in seen or href == base:
+            continue
+        seen.add(href)
+        label = " ".join((a.get_text(" ") or a.get("title") or "").split())[:80]
+        out.append({"label": label, "url": href})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def fetch_linked_page(session: requests.Session, url: str, referer: str, sid: str, timeout: int = 30) -> dict:
+    """Fetch a page the agent chose to follow. Returns a source, or an unread record."""
+    try:
+        r = session.get(url, timeout=timeout, headers={"Referer": referer})
+        r.raise_for_status()
+    except requests.RequestException as e:
+        return {"unread": {"url": url, "reason": f"download failed: {e.__class__.__name__}"}}
+    kind = sniff(r.content)
+    if kind == "pdf":
+        return {"source": {"id": sid, "kind": "pdf", "url": url, "pages": pdf_pages(r.content)}}
+    if kind == "html":
+        title, text = _text_from_html(r.text)
+        if len(text.strip()) < 200:
+            # Script-rendered pages arrive empty; that is "unread", not "no rules".
+            return {"unread": {"url": url, "reason": "page body is empty without JavaScript (client-rendered)"}}
+        return {"source": {"id": sid, "kind": "html", "url": url, "pages": [text], "title": title}, "html": r.text}
+    return {"unread": {"url": url, "reason": f"unsupported file type ({kind})"}}

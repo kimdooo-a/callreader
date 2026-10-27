@@ -1,6 +1,8 @@
 """Read a call with Muse Spark, then let code decide which verdicts survive."""
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta, timezone
+
 from . import meta
 from .axes import AXES, Card, Finding, State
 from .verify import check_quote
@@ -29,7 +31,11 @@ Rules — they are strict:
 Axes:
 {axes}
 
-Return ONLY a JSON array: [{{"axis": key, "verdict": ..., "answer": ..., "quote": ..., "source": id, "page": n, "condition": ...}}]
+6. For the deadline axis also return "deadline_iso": the deadline as ISO 8601 with UTC offset
+   (e.g. "2026-11-30T23:59:00-05:00"); if no time zone is stated write the date only. Do not judge whether it
+   has passed — code compares it with the current time ({now}).
+
+Return ONLY a JSON array: [{{"axis": key, "verdict": ..., "answer": ..., "quote": ..., "source": id, "page": n, "condition": ..., "deadline_iso": ...}}]
 
 SOURCES:
 {sources}
@@ -65,11 +71,33 @@ def _render_sources(sources: list[dict], budget_chars: int = 180_000) -> str:
     return "".join(out)
 
 
+def _deadline_state(iso: str | None, now: datetime) -> tuple[State, str]:
+    if not iso:
+        return State.UNREAD, "no machine-readable deadline"
+    try:
+        if len(iso) == 10:
+            # Date only, no zone: assume the latest zone on Earth (AoE, UTC-12) so we never close a live call early.
+            dl = datetime.fromisoformat(iso + "T23:59:59").replace(tzinfo=timezone(timedelta(hours=-12)))
+            zone_note = " (no time zone stated — assumed AoE)"
+        else:
+            dl = datetime.fromisoformat(iso)
+            if dl.tzinfo is None:
+                dl = dl.replace(tzinfo=timezone(timedelta(hours=-12)))
+            zone_note = ""
+    except ValueError:
+        return State.UNREAD, f"unparseable deadline {iso!r}"
+    left = dl - now
+    if left.total_seconds() <= 0:
+        return State.FAIL, f"deadline passed {-left.days} day(s) ago{zone_note}"
+    return State.PASS, f"{left.days} day(s) left, until {dl.astimezone(timezone.utc).isoformat(timespec='minutes')}{zone_note}"
+
+
 def judge(card: Card, profile: str = DEFAULT_PROFILE) -> Card:
     ocr_images(card.sources)
     axes_txt = "\n".join(f"- {a.key}: {a.question} (FAIL means: {a.fail_means})" for a in AXES)
+    now = datetime.now(UTC)
     raw = meta.chat([{"role": "user", "content": JUDGE_PROMPT.format(
-        profile=profile, axes=axes_txt, sources=_render_sources(card.sources))}])
+        profile=profile, axes=axes_txt, sources=_render_sources(card.sources), now=now.isoformat(timespec="minutes"))}])
     items = meta.parse_json(raw)
     by_axis = {it.get("axis"): it for it in items if isinstance(it, dict)}
     card.findings = []
@@ -90,6 +118,10 @@ def judge(card: Card, profile: str = DEFAULT_PROFILE) -> Card:
                 f.note = f"demoted from {claimed}: {chk.reason}"
         else:
             f.note = "model could not find the rule"
+        if a.key == "deadline" and f.state != State.UNREAD:
+            # The model reads the date; code decides whether it has passed.
+            f.state, extra = _deadline_state(it.get("deadline_iso"), now)
+            f.note = (f.note + "; " if f.note else "") + extra
         if f.state != State.FAIL and card.unread_sources and a.key in ("ai_use", "eligibility", "fee"):
             # A rule can hide in an attachment we could not open. Never call it PASS while one is unread.
             if f.state == State.PASS:
