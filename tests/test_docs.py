@@ -57,3 +57,16 @@ def test_logo_is_not_a_poster():
 
 def test_thumbnail_matches_full_poster():
     assert _same_image(image_key(_png(1440, 2092, "navy")), image_key(_png(800, 1162, "navy")))
+
+
+def test_content_disposition_filename_forms():
+    import requests
+
+    from callreader.fetch import disposition_filename
+    r = requests.Response()
+    for cd in ["attachment; filename*=UTF-8''%EA%B3%B5%EA%B3%A0%EB%AC%B8.hwpx",
+               'attachment; filename="%EA%B3%B5%EA%B3%A0%EB%AC%B8.hwpx"',
+               'attachment; filename="' + "공고문.hwpx".encode("cp949").decode("latin-1") + '"',
+               'attachment; filename="' + "공고문.hwpx".encode("utf-8").decode("latin-1") + '"']:
+        r.headers = {"content-disposition": cd}
+        assert disposition_filename(r) == "공고문.hwpx", cd

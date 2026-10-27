@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import io
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -112,6 +112,28 @@ def find_attachments(html: str, base: str) -> list[str]:
     return urls[:MAX_ATTACH]
 
 
+def disposition_filename(resp: requests.Response) -> str:
+    """The file's real name from Content-Disposition. Korean servers send it as RFC 5987, percent-encoded UTF-8,
+    or raw EUC-KR/UTF-8 bytes that requests has already decoded as Latin-1."""
+    cd = resp.headers.get("content-disposition", "")
+    m = re.search(r"filename\*\s*=\s*([\w-]+)''([^;]+)", cd, re.IGNORECASE)
+    if m:
+        return unquote(m.group(2), encoding=m.group(1) or "utf-8").strip('" ')
+    m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.IGNORECASE)
+    if not m:
+        return ""
+    raw = m.group(1).strip()
+    if "%" in raw:
+        return unquote(raw)
+    b = raw.encode("latin-1", errors="ignore")
+    for enc in ("utf-8", "cp949"):
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw
+
+
 def _viewer_image(html: bytes, base: str) -> str | None:
     """Some boards link posters through an HTML viewer (view_image.php); take the one big <img> inside."""
     soup = BeautifulSoup(html, "html.parser")
@@ -147,6 +169,9 @@ def fetch_call(url: str, timeout: int = 30, session: requests.Session | None = N
                                                           "instead of the file — likely needs a session or referer"}}
             if "source" in got:
                 src = got["source"]
+                name = disposition_filename(ar)
+                if name:
+                    src["filename"] = name
                 if src["kind"] == "image":
                     # The same poster is often linked twice (viewer + thumbnail); keep the largest copy only.
                     src["key"] = image_key(src["bytes"])

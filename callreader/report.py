@@ -25,7 +25,7 @@ CSS = """
 header{padding:20px 24px;border-bottom:1px solid var(--line)}h1{font-size:19px;margin:0 0 4px}
 .meta{color:var(--mut);font-size:13px}.verdict{display:inline-block;font-weight:700;padding:2px 10px;border-radius:99px;margin-right:8px}
 main{display:grid;grid-template-columns:minmax(320px,460px) 1fr;gap:0}@media (max-width:860px){main{grid-template-columns:1fr}}
-main.solo{grid-template-columns:minmax(320px,760px)}main.solo .left{border-right:0}
+main.solo{grid-template-columns:minmax(320px,860px);justify-content:center}main.solo .left{border-right:0}
 .left{padding:16px 20px;border-right:1px solid var(--line)}.right{padding:16px 20px}
 .f{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px;cursor:pointer}
 .f.active{outline:2px solid var(--hl)}.f h3{margin:0 0 4px;font-size:14px;display:flex;gap:8px;align-items:center}
@@ -56,7 +56,7 @@ def _label(sid: str | None, card: Card) -> str:
     if not src:
         return sid or ""
     q = parse_qs(urlparse(src["url"]).query)
-    name = (q.get("user_file_nm") or q.get("filename") or q.get("fileName") or [""])[0]
+    name = src.get("filename") or (q.get("user_file_nm") or q.get("filename") or q.get("fileName") or [""])[0]
     if not name:
         name = _shown(src["url"]) if not src["url"].startswith("http") else unquote(urlparse(src["url"]).path.rsplit("/", 1)[-1])
     kind = src["kind"].replace("-vision", " (vision)").replace("image-ocr", "poster")
