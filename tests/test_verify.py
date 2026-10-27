@@ -36,3 +36,8 @@ def test_too_short_rejected():
 def test_ellipsis_fragments_must_all_match():
     assert check_quote("Works created with AI ... the prize must be returned", SRC).found
     assert not check_quote("Works created with AI ... the prize is doubled", SRC).found
+
+
+def test_short_cjk_clause_is_long_enough():
+    src = [{"id": "page", "pages": ["応募資格 プロ・アマ・年齢不問"]}]
+    assert check_quote("プロ・アマ・年齢不問", src).found

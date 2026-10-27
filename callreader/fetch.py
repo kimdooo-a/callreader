@@ -21,6 +21,20 @@ ATTACH_HINT = re.compile(r"(download|attach|file|첨부|다운로드|요강|guid
 MAX_ATTACH = 12
 
 
+def decode(resp: requests.Response) -> str:
+    """requests falls back to ISO-8859-1 when the header has no charset; Japanese/Korean pages then turn to mojibake.
+    Trust the <meta charset>, then byte detection, before that fallback."""
+    ctype = resp.headers.get("content-type", "").lower()
+    if "charset=" in ctype:
+        return resp.text
+    m = re.search(rb"<meta[^>]+charset=[\"']?([\w-]+)", resp.content[:4096], re.IGNORECASE)
+    enc = m.group(1).decode() if m else (resp.apparent_encoding or "utf-8")
+    try:
+        return resp.content.decode(enc, errors="replace")
+    except LookupError:
+        return resp.content.decode("utf-8", errors="replace")
+
+
 def _text_from_html(html: str) -> tuple[str, str]:
     soup = BeautifulSoup(html, "html.parser")
     for t in soup(["script", "style", "noscript"]):
@@ -78,10 +92,11 @@ def fetch_call(url: str, timeout: int = 30) -> dict:
     s.headers.update({"User-Agent": UA})
     r = s.get(url, timeout=timeout)
     r.raise_for_status()
-    title, text = _text_from_html(r.text)
+    html = decode(r)
+    title, text = _text_from_html(html)
     sources = [{"id": "page", "kind": "html", "url": url, "pages": [text]}]
     unread: list[dict] = []
-    for i, au in enumerate(find_attachments(r.text, url), 1):
+    for i, au in enumerate(find_attachments(html, url), 1):
         try:
             ar = s.get(au, timeout=timeout, headers={"Referer": url})
             ar.raise_for_status()
@@ -104,7 +119,7 @@ def fetch_call(url: str, timeout: int = 30) -> dict:
                 unread.append({"url": au, "reason": f"unsupported file type ({kind})"})
         except requests.RequestException as e:
             unread.append({"url": au, "reason": f"download failed: {e.__class__.__name__}"})
-    return {"title": title, "sources": sources, "unread": unread, "html": r.text, "session": s}
+    return {"title": title, "sources": sources, "unread": unread, "html": html, "session": s}
 
 
 def all_links(html: str, base: str, limit: int = 150) -> list[dict]:
@@ -134,9 +149,10 @@ def fetch_linked_page(session: requests.Session, url: str, referer: str, sid: st
     if kind == "pdf":
         return {"source": {"id": sid, "kind": "pdf", "url": url, "pages": pdf_pages(r.content)}}
     if kind == "html":
-        title, text = _text_from_html(r.text)
+        html = decode(r)
+        title, text = _text_from_html(html)
         if len(text.strip()) < 200:
             # Script-rendered pages arrive empty; that is "unread", not "no rules".
             return {"unread": {"url": url, "reason": "page body is empty without JavaScript (client-rendered)"}}
-        return {"source": {"id": sid, "kind": "html", "url": url, "pages": [text], "title": title}, "html": r.text}
+        return {"source": {"id": sid, "kind": "html", "url": url, "pages": [text], "title": title}, "html": html}
     return {"unread": {"url": url, "reason": f"unsupported file type ({kind})"}}

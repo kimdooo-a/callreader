@@ -32,6 +32,11 @@ def normalize(text: str) -> str:
     return text.strip().lower()
 
 
+def _weight(s: str) -> int:
+    """CJK characters carry about a word each; count them double so a 10-character Japanese clause is not 'too short'."""
+    return sum(2 if ord(ch) >= 0x2E80 else 1 for ch in s)
+
+
 @dataclass
 class QuoteCheck:
     found: bool
@@ -50,7 +55,7 @@ def check_quote(quote: str, sources: list[dict], min_len: int = 12) -> QuoteChec
     fragments = [f.strip(" .") for f in re.split(r"\.\.\.|…", q) if f.strip(" .")]
     if not fragments:
         return QuoteCheck(False, reason="empty quote")
-    if sum(len(f) for f in fragments) < min_len:
+    if sum(_weight(f) for f in fragments) < min_len:
         return QuoteCheck(False, reason=f"quote shorter than {min_len} chars — too weak to prove anything")
     for src in sources:
         for i, page in enumerate(src.get("pages", [])):

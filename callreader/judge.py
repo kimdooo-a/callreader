@@ -89,16 +89,27 @@ def _deadline_state(iso: str | None, now: datetime) -> tuple[State, str]:
     left = dl - now
     if left.total_seconds() <= 0:
         return State.FAIL, f"deadline passed {-left.days} day(s) ago{zone_note}"
-    return State.PASS, f"{left.days} day(s) left, until {dl.astimezone(timezone.utc).isoformat(timespec='minutes')}{zone_note}"
+    return State.PASS, f"{left.days} day(s) left, until {dl.astimezone(UTC).isoformat(timespec='minutes')}{zone_note}"
 
 
 def judge(card: Card, profile: str = DEFAULT_PROFILE) -> Card:
     ocr_images(card.sources)
     axes_txt = "\n".join(f"- {a.key}: {a.question} (FAIL means: {a.fail_means})" for a in AXES)
     now = datetime.now(UTC)
-    raw = meta.chat([{"role": "user", "content": JUDGE_PROMPT.format(
-        profile=profile, axes=axes_txt, sources=_render_sources(card.sources), now=now.isoformat(timespec="minutes"))}])
-    items = meta.parse_json(raw)
+    prompt = JUDGE_PROMPT.format(
+        profile=profile, axes=axes_txt, sources=_render_sources(card.sources), now=now.isoformat(timespec="minutes"))
+    items = None
+    for attempt in range(2):
+        # Reasoning tokens count against max_tokens; a long call can exhaust the budget before any JSON is written.
+        raw = meta.chat([{"role": "user", "content": prompt}], max_tokens=32000)
+        try:
+            items = meta.parse_json(raw)
+            break
+        except ValueError:
+            continue
+    if items is None:
+        card.findings = [Finding(a.key, State.UNREAD, note="model returned no parsable verdicts") for a in AXES]
+        return card
     by_axis = {it.get("axis"): it for it in items if isinstance(it, dict)}
     card.findings = []
     for a in AXES:
