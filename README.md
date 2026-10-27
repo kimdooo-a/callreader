@@ -64,6 +64,12 @@ export MODEL_API_KEY=...        # Meta Model API key
 python -m callreader https://singaporeunbound.org/opp/flash-fiction3
 ```
 
+## Web
+
+```bash
+python -m callreader.web        # http://127.0.0.1:8765 — paste a URL or drop a poster/PDF/HWPX/HWP
+```
+
 ## Meta models used
 
 | Step | Model |
