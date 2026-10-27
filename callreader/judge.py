@@ -1,7 +1,6 @@
 """Read a call with Muse Spark, then let code decide which verdicts survive."""
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -45,19 +44,21 @@ SOURCES:
 {sources}
 """
 
-SUPPORT_PROMPT = """You are auditing verdicts about an open call. For each item, decide ONLY from the quoted text
-(and its condition quote) whether the quote by itself establishes the verdict for this entrant:
+SUPPORT_PROMPT = """You are auditing one verdict about an open call. Decide ONLY from the quoted text (and its
+condition quote) whether the quote by itself establishes the verdict on this question for this entrant:
 {profile}
 
+Question: {question}
+Verdict: {verdict}
+Summary given to the entrant: {summary}
+Quote: {quote}
+Condition quote: {condition_quote}
+
 A quote that names a topic does not establish a rule about it. "The theme is generative AI" says nothing
-about whether AI tools may be used to make the entry. A quote about one thing does not settle another.
-Judge the verdict on the axis question only; extra detail in the summary that the quote does not cover is
-not by itself a reason for false. When unsure, answer false.
+about whether AI tools may be used to make the entry. Judge the verdict on THIS question only; extra detail in
+the summary that the quote does not cover is not by itself a reason for false. When unsure, answer false.
 
-Items:
-{items}
-
-Return JSON: {{"items": [{{"axis": key, "supported": true|false, "why": "one short sentence"}}]}}"""
+Return JSON: {{"supported": true|false, "why": "one short sentence"}}"""
 
 _S = {"type": "string"}
 VERDICTS_SCHEMA = meta.obj({"items": {"type": "array", "items": meta.obj({
@@ -65,8 +66,7 @@ VERDICTS_SCHEMA = meta.obj({"items": {"type": "array", "items": meta.obj({
     "verdict": {"type": "string", "enum": ["PASS", "FAIL", "UNREAD"]},
     "answer": _S, "quote": _S, "source": _S, "page": {"type": "integer"},
     "condition": _S, "condition_quote": _S, "deadline_iso": _S})}})
-SUPPORT_SCHEMA = meta.obj({"items": {"type": "array", "items": meta.obj({
-    "axis": _S, "supported": {"type": "boolean"}, "why": _S})}})
+SUPPORT_SCHEMA = meta.obj({"supported": {"type": "boolean"}, "why": _S})
 
 DEFAULT_PROFILE = "An individual (solo, not a student) living in South Korea, entering online, who uses generative AI tools."
 
@@ -78,6 +78,15 @@ def _transcribe(png: bytes, mime: str) -> str:
     text = meta.chat([{"role": "user", "content": [
         {"type": "text", "text": TRANSCRIBE_PROMPT}, meta.image_part(png, mime)]}])
     return "" if text.strip() == "EMPTY" else text
+
+
+def _as_png(data: bytes) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+    buf = BytesIO()
+    Image.open(BytesIO(data)).convert("RGB").save(buf, "PNG")
+    return buf.getvalue()
 
 
 def _render_pdf(data: bytes, limit: int) -> list[bytes]:
@@ -96,9 +105,11 @@ def ocr_images(card_sources: list[dict]) -> None:
         if src["kind"] == "image" and src.get("bytes"):
             jobs.append((src, 0, src["bytes"], src.get("mime", "image/png")))
             src["kind"] = "image-ocr"
+            src["images"] = [_as_png(src["bytes"])]
         elif src["kind"] in ("pdf", "pdf-scan") and src.get("bytes"):
             pngs = _render_pdf(src["bytes"], VISION_MAX_PDF_PAGES)
-            sib = {"id": f"{src['id']}.vision", "kind": "pdf-vision", "url": src["url"], "pages": [""] * len(pngs)}
+            sib = {"id": f"{src['id']}.vision", "kind": "pdf-vision", "url": src["url"], "pages": [""] * len(pngs),
+                   "images": pngs}
             extra.append(sib)
             jobs += [(sib, i, png, "image/png") for i, png in enumerate(pngs)]
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -204,17 +215,22 @@ def audit_support(card: Card, profile: str) -> None:
     if not claimed:
         return
     question = {a.key: f"{a.question} (FAIL means: {a.fail_means})" for a in AXES}
-    items = "\n".join(json.dumps({"axis": f.axis, "question": question[f.axis], "verdict": f.state.value,
-                                  "summary": f.answer, "quote": f.quote,
-                                  "condition_quote": f.condition_quote}, ensure_ascii=False) for f in claimed)
-    try:
-        raw = meta.chat([{"role": "user", "content": SUPPORT_PROMPT.format(profile=profile, items=items)}],
-                        max_tokens=16000, schema=SUPPORT_SCHEMA)
-        rows = {r.get("axis"): r for r in meta.parse_json(raw)["items"] if isinstance(r, dict)}
-    except (ValueError, KeyError):
-        return  # audit unavailable: keep code-verified verdicts, but say so
-    for f in claimed:
-        r = rows.get(f.axis)
-        if r and r.get("supported") is False:
+
+    def audit(f):
+        # One call per verdict: batching let the auditor carry one axis's question into another's.
+        raw = meta.chat([{"role": "user", "content": SUPPORT_PROMPT.format(
+            profile=profile, question=question[f.axis], verdict=f.state.value, summary=f.answer,
+            quote=f.quote, condition_quote=f.condition_quote or "(none)")}], max_tokens=12000, schema=SUPPORT_SCHEMA)
+        try:
+            return meta.parse_json(raw)
+        except ValueError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(audit, claimed))
+    for f, r in zip(claimed, results):
+        if r is None:
+            f.note = (f.note + "; " if f.note else "") + "support audit unavailable"
+        elif r.get("supported") is False:
             f.note = (f.note + "; " if f.note else "") + f"demoted from {f.state.value}: quote does not establish it — {r.get('why', '')}"
             f.state = State.UNREAD

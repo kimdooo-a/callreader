@@ -9,7 +9,9 @@ from dataclasses import asdict
 from . import meta
 from .agent import explore
 from .axes import Card, State
-from .judge import judge
+from .judge import DEFAULT_PROFILE, judge
+from .locate import locate
+from .report import render
 
 ICON = {State.PASS: "PASS  ", State.FAIL: "FAIL  ", State.UNREAD: "UNREAD"}
 
@@ -18,17 +20,26 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="callreader")
     ap.add_argument("url")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--profile", default=DEFAULT_PROFILE,
+                    help="who is entering — eligibility is judged against this (age, nationality, residence, team)")
+    ap.add_argument("--html", metavar="FILE", help="also write a self-contained report with quotes highlighted on the pages")
     ap.add_argument("--hops", type=int, default=2, help="how many link hops the agent may follow (0 = page + attachments only)")
     args = ap.parse_args()
 
     got = explore(args.url, hops=args.hops, log=lambda m: print(m, file=sys.stderr))
     card = Card(url=args.url, title=got["title"], sources=got["sources"], unread_sources=got["unread"])
-    judge(card)
+    judge(card, profile=args.profile)
+    if args.html:
+        locate(card)
+        with open(args.html, "w", encoding="utf-8") as fh:
+            fh.write(render(card))
+        print(f"report: {args.html}", file=sys.stderr)
 
     if args.json:
         out = asdict(card)
         for s in out["sources"]:
             s.pop("bytes", None)
+            s.pop("images", None)
         out["verdict"] = card.verdict.value
         out["cost_usd"] = round(meta.cost_usd(), 4)
         print(json.dumps(out, ensure_ascii=False, indent=2, default=str))

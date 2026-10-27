@@ -41,6 +41,10 @@ citation verifier (plain code) ──► quote must exist verbatim in the fetche
 - **Two readings of every PDF.** The text layer (PyMuPDF) and a Muse Spark vision transcription of each rendered page are
   both kept as sources; Korean PDFs often have a text layer in the wrong reading order, and a quote only needs to match one.
 
+- **Show me where it says that.** With `--html report.html`, Muse Spark grounds each verified quote to a box on the
+  poster or PDF page. A box is a claim too: the crop is read back, and the highlight is kept only if the read-back
+  contains the quote (grounding on dense pages is often one line off — those boxes are caught and widened or dropped).
+
 Start from a poster photo alone:
 
 ```bash
@@ -69,6 +73,7 @@ python -m callreader https://singaporeunbound.org/opp/flash-fiction3
 | Choosing which rule/policy links to follow | Muse Spark 1.3 |
 | Posters and every rendered PDF page → text | Muse Spark 1.3 vision |
 | Finding QR codes on posters | SAM 3.1 (decoding is plain code: zxing-cpp) |
+| Locating each quote on the page image, then reading the crop back | Muse Spark 1.3 grounding + vision |
 | Info-session video → text (planned) | Muse Voice Transcribe |
 
 ## License
