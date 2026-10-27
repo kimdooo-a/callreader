@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 from . import meta
 from .axes import AXES, Card, Finding, State
-from .verify import check_quote
+from .verify import check_quote, quote_context
 
 TRANSCRIBE_PROMPT = (
     "Transcribe every piece of text visible in this image exactly as written, in its original language. "
@@ -44,8 +44,8 @@ SOURCES:
 {sources}
 """
 
-SUPPORT_PROMPT = """You are auditing one verdict about an open call. Decide ONLY from the quoted text (and its
-condition quote) whether the quote by itself establishes the verdict on this question for this entrant:
+SUPPORT_PROMPT = """You are auditing one verdict about an open call. Decide whether the quote — read in the
+surrounding source text it was cut from — establishes the verdict on this question for this entrant:
 {profile}
 
 Question: {question}
@@ -53,10 +53,16 @@ Verdict: {verdict}
 Summary given to the entrant: {summary}
 Quote: {quote}
 Condition quote: {condition_quote}
+Surrounding source text (the quote sits inside it; a list item is governed by the sentence that introduces it):
+<<<
+{context}
+>>>
 
-A quote that names a topic does not establish a rule about it. "The theme is generative AI" says nothing
-about whether AI tools may be used to make the entry. Judge the verdict on THIS question only; extra detail in
-the summary that the quote does not cover is not by itself a reason for false. When unsure, answer false.
+The quote must be the passage that carries the rule; the surrounding text is there only so you can read a list
+item or a clause with its governing sentence. A quote that names a topic does not establish a rule about it:
+"The theme is generative AI" says nothing about whether AI tools may be used to make the entry. Judge the verdict
+on THIS question only; extra detail in the summary that the quote does not cover is not by itself a reason for
+false. When unsure, answer false.
 
 Return JSON: {{"supported": true|false, "why": "one short sentence"}}"""
 
@@ -220,7 +226,8 @@ def audit_support(card: Card, profile: str) -> None:
         # One call per verdict: batching let the auditor carry one axis's question into another's.
         raw = meta.chat([{"role": "user", "content": SUPPORT_PROMPT.format(
             profile=profile, question=question[f.axis], verdict=f.state.value, summary=f.answer,
-            quote=f.quote, condition_quote=f.condition_quote or "(none)")}], max_tokens=12000, schema=SUPPORT_SCHEMA)
+            quote=f.quote, condition_quote=f.condition_quote or "(none)",
+            context=quote_context(f.quote, card.sources))}], max_tokens=12000, schema=SUPPORT_SCHEMA)
         try:
             return meta.parse_json(raw)
         except ValueError:

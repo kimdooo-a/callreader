@@ -5,11 +5,13 @@ import base64
 import html
 import io
 import os
+from urllib.parse import parse_qs, unquote, urlparse
 
 from PIL import Image
 
 from . import meta
 from .axes import Card, State
+from .verify import normalize, quote_context
 
 LABEL = {"eligibility": "Eligibility", "fee": "Entry fee", "cash": "Cash prize", "onsite": "On-site / team",
          "ai_use": "AI use", "authorship": "Authorship & rights", "deadline": "Deadline"}
@@ -23,6 +25,7 @@ CSS = """
 header{padding:20px 24px;border-bottom:1px solid var(--line)}h1{font-size:19px;margin:0 0 4px}
 .meta{color:var(--mut);font-size:13px}.verdict{display:inline-block;font-weight:700;padding:2px 10px;border-radius:99px;margin-right:8px}
 main{display:grid;grid-template-columns:minmax(320px,460px) 1fr;gap:0}@media (max-width:860px){main{grid-template-columns:1fr}}
+main.solo{grid-template-columns:minmax(320px,760px)}main.solo .left{border-right:0}
 .left{padding:16px 20px;border-right:1px solid var(--line)}.right{padding:16px 20px}
 .f{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px;cursor:pointer}
 .f.active{outline:2px solid var(--hl)}.f h3{margin:0 0 4px;font-size:14px;display:flex;gap:8px;align-items:center}
@@ -34,6 +37,8 @@ blockquote{margin:6px 0;padding:4px 10px;border-left:3px solid var(--line);font-
 .page img{display:block;width:100%;height:auto}.cap{font-size:12px;color:var(--mut);margin:0 0 4px}
 .box{position:absolute;border:2px solid var(--hl);background:color-mix(in srgb,var(--hl) 14%,transparent);border-radius:3px;transition:box-shadow .2s}
 .box.cond{border-style:dashed}.box.on{box-shadow:0 0 0 4px color-mix(in srgb,var(--hl) 45%,transparent)}
+.ctx{font-size:12.5px;color:var(--mut);margin-top:6px;padding:6px 8px;background:var(--bg);border-radius:6px}
+mark{background:color-mix(in srgb,var(--hl) 25%,transparent);color:var(--fg);padding:0 1px}
 .unread-list{font-size:13px}.unread-list li{margin-bottom:4px}
 """
 
@@ -43,6 +48,19 @@ document.querySelectorAll('.f').forEach(el=>el.addEventListener('click',()=>{
  document.querySelectorAll('.box').forEach(b=>b.classList.toggle('on',b.dataset.axis===el.dataset.axis));
  const b=document.querySelector('.box[data-axis="'+el.dataset.axis+'"]');if(b)b.scrollIntoView({behavior:'smooth',block:'center'});}));
 """
+
+
+def _label(sid: str | None, card: Card) -> str:
+    """att3 → 'hwpx · [공고문] ….hwpx' — the reader should see which file the rule came from."""
+    src = next((s for s in card.sources if s["id"] == sid), None)
+    if not src:
+        return sid or ""
+    q = parse_qs(urlparse(src["url"]).query)
+    name = (q.get("user_file_nm") or q.get("filename") or q.get("fileName") or [""])[0]
+    if not name:
+        name = _shown(src["url"]) if not src["url"].startswith("http") else unquote(urlparse(src["url"]).path.rsplit("/", 1)[-1])
+    kind = src["kind"].replace("-vision", " (vision)").replace("image-ocr", "poster")
+    return f"{kind} · {name}" if name else kind
 
 
 def _shown(url: str) -> str:
@@ -71,8 +89,15 @@ def render(card: Card) -> str:
         parts.append(f"<div class='f' data-axis='{f.axis}'><h3><span class='st {s}'>{s}</span>{LABEL.get(f.axis, f.axis)}</h3>"
                      f"<div>{e(f.answer)}</div>")
         if f.quote and f.state != State.UNREAD:
-            parts.append(f"<blockquote>{e(f.quote)}</blockquote><div class='src'>{e(f.source_id or '')} · p.{f.page}"
+            parts.append(f"<blockquote>{e(f.quote)}</blockquote><div class='src'>{e(_label(f.source_id, card))} · p.{f.page}"
                          f"{' · highlighted' if any(b['kind'] == 'quote' for b in f.boxes) else ''}</div>")
+            if not any(b["kind"] == "quote" for b in f.boxes):
+                # No page image (HTML, HWPX, HWP): show the quote marked inside the text it was cut from.
+                ctx = quote_context(f.quote, card.sources, before=220, after=160)
+                q = normalize(f.quote)
+                if ctx and q in ctx:
+                    i = ctx.index(q)
+                    parts.append(f"<div class='ctx'>…{e(ctx[:i])}<mark>{e(ctx[i:i + len(q)])}</mark>{e(ctx[i + len(q):])}…</div>")
         if f.condition:
             if f.condition_verified:
                 parts.append(f"<div class='cond'>Condition: {e(f.condition)}</div><blockquote>{e(f.condition_quote)}</blockquote>")
@@ -102,7 +127,9 @@ def render(card: Card) -> str:
             parts.append(f"<div class='box{' cond' if b['kind'] == 'condition' else ''}' data-axis='{axis}' title='{LABEL.get(axis, axis)}' "
                          f"style='left:{x1 / 10}%;top:{y1 / 10}%;width:{(x2 - x1) / 10}%;height:{(y2 - y1) / 10}%'></div>")
         parts.append("</div>")
-    if not shown:
-        parts.append("<p class='note'>No quote could be placed on a page image.</p>")
     parts.append(f"</section></main><script>{JS}</script></body></html>")
-    return "".join(parts)
+    out = "".join(parts)
+    if not shown:
+        # Nothing to show on a page image (HTML, HWPX, HWP sources): one column, quotes marked in their text.
+        out = out.replace("<main>", "<main class='solo'>", 1).replace("<section class='right'></section>", "")
+    return out

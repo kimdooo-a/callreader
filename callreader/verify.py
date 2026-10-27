@@ -63,3 +63,19 @@ def check_quote(quote: str, sources: list[dict], min_len: int = 12) -> QuoteChec
             if all(f in p for f in fragments):
                 return QuoteCheck(True, source_id=src["id"], page=i + 1)
     return QuoteCheck(False, reason="quote not found verbatim in any fetched source")
+
+
+def quote_context(quote: str, sources: list[dict], before: int = 500, after: int = 250) -> str:
+    """The normalized source text around where `quote` was found — so a list item is read with the sentence above it.
+    Cut by code from what we fetched, never written by the model."""
+    q = normalize(quote or "")
+    first = next((f.strip(" .") for f in re.split(r"\.\.\.|…", q) if f.strip(" .")), "")
+    if not first:
+        return ""
+    for src in sources:
+        for page in src.get("pages", []):
+            p = normalize(page)
+            i = p.find(first)
+            if i >= 0:
+                return p[max(0, i - before): i + len(q) + after]
+    return ""
